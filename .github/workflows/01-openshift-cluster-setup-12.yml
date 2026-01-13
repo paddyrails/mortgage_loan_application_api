@@ -265,21 +265,8 @@ jobs:
             fi
             
             # Create ROSA cluster with STS
-            rosa create cluster \
-              --cluster-name=${{ env.CLUSTER_NAME }} \
-              --region=${{ env.AWS_REGION }} \
-              --version=4.18.30 \
-              --replicas=${{ env.COMPUTE_NODES }} \
-              --compute-machine-type=${{ env.COMPUTE_MACHINE_TYPE }} \
-              --machine-cidr=10.0.0.0/16 \
-              --service-cidr=172.30.0.0/16 \
-              --pod-cidr=10.128.0.0/14 \
-              --host-prefix=23 \
-              --subnet-ids=${{ env.SUBNET_IDS }} \              
-              --sts \
-              --mode=auto \
-              --yes
-            
+            rosa create cluster --cluster-name=${{ env.CLUSTER_NAME }} --region=${{ env.AWS_REGION }} --version=4.18.30 --replicas=${{ env.COMPUTE_NODES }} --compute-machine-type=${{ env.COMPUTE_MACHINE_TYPE }} --machine-cidr=10.0.0.0/16 --service-cidr=172.30.0.0/16 --pod-cidr=10.128.0.0/14 --host-prefix=23 --subnet-ids=${{ env.SUBNET_IDS }} --sts  --mode=auto --yes
+
             echo ""
             echo "⏳ Cluster creation initiated. Waiting for cluster to be ready..."
             
