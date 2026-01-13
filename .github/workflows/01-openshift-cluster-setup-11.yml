@@ -219,9 +219,6 @@ jobs:
             echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID,$SUBNET3_ID" >> $GITHUB_ENV
             
             echo "✅ VPC created successfully!"
-
-            aws iam create-service-linked-role --aws-service-name "elasticloadbalancing.amazonaws.com"
-            echo "✅ Service-linked role for elasticloadbalancing.amazonaws.com created successfully!"
           fi
 
       # -----------------------------------------
