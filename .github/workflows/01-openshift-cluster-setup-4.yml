@@ -211,6 +211,7 @@ jobs:
             
             echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
             echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID" >> $GITHUB_ENV
+            echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID" >> $GITHUB_ENV
             
             echo "✅ VPC created successfully!"
           fi
@@ -269,6 +270,7 @@ jobs:
               --service-cidr=172.30.0.0/16 \
               --pod-cidr=10.128.0.0/14 \
               --host-prefix=23 \
+              --multi-az=false \
               --subnet-ids=$SUBNET_IDS \
               --sts \
               --mode=auto \
