@@ -30,7 +30,7 @@ on:
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}-${{ github.event.inputs.environment }}
-  ROSA_VERSION: "4.12.12"
+  ROSA_VERSION: "4.18.30"
   COMPUTE_NODES: 2
   COMPUTE_MACHINE_TYPE: m5.xlarge
 
