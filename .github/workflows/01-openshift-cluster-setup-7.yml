@@ -186,7 +186,13 @@ jobs:
               --query 'Subnet.SubnetId' \
               --output text)
             
-
+            SUBNET3_ID=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID \
+              --cidr-block 10.0.3.0/24 \
+              --availability-zone ${{ env.AWS_REGION }}c \
+              --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$VPC_NAME-public-3}]" \
+              --query 'Subnet.SubnetId' \
+              --output text)
             
             # Create route table and associate with subnets
             RTB_ID=$(aws ec2 create-route-table \
@@ -202,16 +208,15 @@ jobs:
             
             aws ec2 associate-route-table --subnet-id $SUBNET1_ID --route-table-id $RTB_ID
             aws ec2 associate-route-table --subnet-id $SUBNET2_ID --route-table-id $RTB_ID
-            # aws ec2 associate-route-table --subnet-id $SUBNET3_ID --route-table-id $RTB_ID
+            aws ec2 associate-route-table --subnet-id $SUBNET3_ID --route-table-id $RTB_ID
             
             # Enable auto-assign public IP
             aws ec2 modify-subnet-attribute --subnet-id $SUBNET1_ID --map-public-ip-on-launch
             aws ec2 modify-subnet-attribute --subnet-id $SUBNET2_ID --map-public-ip-on-launch
-            # aws ec2 modify-subnet-attribute --subnet-id $SUBNET3_ID --map-public-ip-on-launch
+            aws ec2 modify-subnet-attribute --subnet-id $SUBNET3_ID --map-public-ip-on-launch
             
             echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
-            echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID" >> $GITHUB_ENV
-            echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID" >> $GITHUB_ENV
+            echo "SUBNET_IDS=$SUBNET1_ID,$SUBNET2_ID,$SUBNET3_ID" >> $GITHUB_ENV
             
             echo "✅ VPC created successfully!"
           fi
@@ -270,7 +275,6 @@ jobs:
               --service-cidr=172.30.0.0/16 \
               --pod-cidr=10.128.0.0/14 \
               --host-prefix=23 \
-              --multi-az=false \
               --subnet-ids=${{ env.SUBNET_IDS }} \
               --sts \
               --mode=auto \
