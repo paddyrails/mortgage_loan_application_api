@@ -278,8 +278,7 @@ jobs:
               --service-cidr=172.30.0.0/16 \
               --pod-cidr=10.128.0.0/14 \
               --host-prefix=23 \
-              --subnet-ids=${{ env.SUBNET_IDS }} \
-              --multi-az=false \
+              --subnet-ids=${{ env.SUBNET_IDS }} \              
               --sts \
               --mode=auto \
               --yes
