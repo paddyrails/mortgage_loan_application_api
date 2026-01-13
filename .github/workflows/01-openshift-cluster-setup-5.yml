@@ -271,7 +271,7 @@ jobs:
               --pod-cidr=10.128.0.0/14 \
               --host-prefix=23 \
               --multi-az=false \
-              --subnet-ids=$SUBNET_IDS \
+              --subnet-ids=${{ env.SUBNET_IDS }} \
               --sts \
               --mode=auto \
               --yes
