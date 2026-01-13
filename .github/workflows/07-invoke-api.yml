@@ -1,0 +1,764 @@
+name: Test - Invoke API Endpoints
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment to test"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - preprod
+          - prod
+      cluster_name:
+        description: "ROSA Cluster Name"
+        required: true
+        default: "loan-app-cluster"
+      test_type:
+        description: "Type of API test"
+        required: true
+        type: choice
+        options:
+          - all (Complete CRUD Test)
+          - create-only
+          - read-only
+          - update-only
+          - delete-only
+          - search-only
+          - statistics-only
+      cleanup_test_data:
+        description: "Cleanup test data after tests"
+        required: true
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}-${{ github.event.inputs.environment }}
+  NAMESPACE: loan-app-${{ github.event.inputs.environment }}
+  APP_NAME: loan-application
+
+jobs:
+  api-tests:
+    name: API Tests - ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      test_status: ${{ steps.summary.outputs.test_status }}
+      tests_passed: ${{ steps.summary.outputs.tests_passed }}
+      tests_failed: ${{ steps.summary.outputs.tests_failed }}
+
+    steps:
+      # -----------------------------------------
+      # Step 1: Checkout code
+      # -----------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------
+      # Step 2: Configure AWS Credentials
+      # -----------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------
+      # Step 3: Install CLI Tools
+      # -----------------------------------------
+      - name: Install CLI Tools
+        run: |
+          # Install OpenShift CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+          # Install ROSA CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xzf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+          # Install jq
+          sudo apt-get update && sudo apt-get install -y jq
+
+          echo "✅ CLI tools installed!"
+
+      # -----------------------------------------
+      # Step 4: Login to OpenShift
+      # -----------------------------------------
+      - name: Login to OpenShift
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+          API_URL=$(rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} --output json | jq -r '.api.url')
+
+          oc login $API_URL \
+            --username=${{ secrets.OPENSHIFT_ADMIN_USER }} \
+            --password=${{ secrets.OPENSHIFT_ADMIN_PASSWORD }} \
+            --insecure-skip-tls-verify=true
+
+          oc project ${{ env.NAMESPACE }}
+          echo "✅ Logged in to OpenShift!"
+
+      # -----------------------------------------
+      # Step 5: Get Application URL
+      # -----------------------------------------
+      - name: Get Application URL
+        id: get-url
+        run: |
+          APP_HOST=$(oc get route ${{ env.APP_NAME }} \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.spec.host}')
+
+          APP_URL="https://${APP_HOST}"
+          echo "app_url=${APP_URL}" >> $GITHUB_OUTPUT
+          echo "api_base=${APP_URL}/api" >> $GITHUB_OUTPUT
+          echo "Application URL: ${APP_URL}"
+
+      # -----------------------------------------
+      # Step 6: Initialize Test Results
+      # -----------------------------------------
+      - name: Initialize Test Results
+        run: |
+          echo "TESTS_PASSED=0" >> $GITHUB_ENV
+          echo "TESTS_FAILED=0" >> $GITHUB_ENV
+          echo "CREATED_LOAN_ID=" >> $GITHUB_ENV
+          mkdir -p test-results
+
+      # -----------------------------------------
+      # Step 7: Test - Health Check
+      # -----------------------------------------
+      - name: Test - Health Check
+        id: test-health
+        run: |
+          echo "=========================================="
+          echo "TEST: Health Check Endpoint"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/health")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Health check endpoint"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Health check endpoint"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 8: Test - Create Loan (POST)
+      # -----------------------------------------
+      - name: Test - Create Loan (POST)
+        id: test-create
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'create-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Create Loan (POST /api/loans)"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          TIMESTAMP=$(date +%s)
+
+          # Create test loan data
+          LOAN_DATA=$(cat <<EOF
+          {
+            "applicantName": "Test User ${TIMESTAMP}",
+            "applicantEmail": "testuser${TIMESTAMP}@example.com",
+            "applicantPhone": "+1-555-${TIMESTAMP:(-4)}",
+            "loanAmount": 75000.00,
+            "loanTermMonths": 48,
+            "interestRate": 6.5,
+            "loanType": 1,
+            "purpose": "Test loan created by GitHub Actions API test workflow",
+            "notes": "Automated test - Environment: ${{ github.event.inputs.environment }}"
+          }
+          EOF
+          )
+
+          echo "Request Body:"
+          echo "$LOAN_DATA" | jq .
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$LOAN_DATA" \
+            "${API_BASE}/loans")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo ""
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "201" ]; then
+            echo "✅ TEST PASSED: Create loan"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+            
+            # Extract created loan ID for subsequent tests
+            LOAN_ID=$(echo "$BODY" | jq -r '.data.id')
+            LOAN_NUMBER=$(echo "$BODY" | jq -r '.data.loanNumber')
+            echo "CREATED_LOAN_ID=$LOAN_ID" >> $GITHUB_ENV
+            echo "CREATED_LOAN_NUMBER=$LOAN_NUMBER" >> $GITHUB_ENV
+            echo ""
+            echo "Created Loan ID: $LOAN_ID"
+            echo "Created Loan Number: $LOAN_NUMBER"
+          else
+            echo "❌ TEST FAILED: Create loan"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 9: Test - Get All Loans (GET)
+      # -----------------------------------------
+      - name: Test - Get All Loans (GET)
+        id: test-get-all
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'read-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Get All Loans (GET /api/loans)"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans?pageNumber=1&pageSize=10")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            TOTAL_COUNT=$(echo "$BODY" | jq -r '.data.totalCount')
+            echo ""
+            echo "Total Loans: $TOTAL_COUNT"
+            echo "✅ TEST PASSED: Get all loans"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get all loans"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 10: Test - Get Loan by ID (GET)
+      # -----------------------------------------
+      - name: Test - Get Loan by ID (GET)
+        id: test-get-by-id
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'read-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Get Loan by ID (GET /api/loans/{id})"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          # Use created loan ID or default to 1
+          LOAN_ID="${CREATED_LOAN_ID:-1}"
+          echo "Testing with Loan ID: $LOAN_ID"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans/${LOAN_ID}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Get loan by ID"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get loan by ID"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 11: Test - Get Loan by Number (GET)
+      # -----------------------------------------
+      - name: Test - Get Loan by Number (GET)
+        id: test-get-by-number
+        if: ${{ (github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'read-only') && env.CREATED_LOAN_NUMBER != '' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Get Loan by Number (GET /api/loans/number/{loanNumber})"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          LOAN_NUMBER="${CREATED_LOAN_NUMBER}"
+
+          echo "Testing with Loan Number: $LOAN_NUMBER"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans/number/${LOAN_NUMBER}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Get loan by number"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get loan by number"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 12: Test - Update Loan (PUT)
+      # -----------------------------------------
+      - name: Test - Update Loan (PUT)
+        id: test-update
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'update-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Update Loan (PUT /api/loans/{id})"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          LOAN_ID="${CREATED_LOAN_ID:-1}"
+
+          echo "Updating Loan ID: $LOAN_ID"
+
+          UPDATE_DATA=$(cat <<EOF
+          {
+            "loanAmount": 80000.00,
+            "interestRate": 6.25,
+            "notes": "Updated by GitHub Actions API test - $(date)"
+          }
+          EOF
+          )
+
+          echo "Request Body:"
+          echo "$UPDATE_DATA" | jq .
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -X PUT \
+            -H "Content-Type: application/json" \
+            -d "$UPDATE_DATA" \
+            "${API_BASE}/loans/${LOAN_ID}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo ""
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Update loan"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Update loan"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 13: Test - Update Loan Status (PATCH)
+      # -----------------------------------------
+      - name: Test - Update Loan Status (PATCH)
+        id: test-update-status
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'update-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Update Loan Status (PATCH /api/loans/{id}/status)"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          LOAN_ID="${CREATED_LOAN_ID:-1}"
+
+          echo "Updating status for Loan ID: $LOAN_ID"
+
+          STATUS_DATA=$(cat <<EOF
+          {
+            "status": 2,
+            "remarks": "Status updated to UnderReview by GitHub Actions test"
+          }
+          EOF
+          )
+
+          echo "Request Body:"
+          echo "$STATUS_DATA" | jq .
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -X PATCH \
+            -H "Content-Type: application/json" \
+            -d "$STATUS_DATA" \
+            "${API_BASE}/loans/${LOAN_ID}/status")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo ""
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            NEW_STATUS=$(echo "$BODY" | jq -r '.data.status')
+            echo "New Status: $NEW_STATUS"
+            echo "✅ TEST PASSED: Update loan status"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Update loan status"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 14: Test - Search Loans (GET)
+      # -----------------------------------------
+      - name: Test - Search Loans (GET)
+        id: test-search
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'search-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Search Loans (GET /api/loans/search)"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          SEARCH_TERM="Test"
+
+          echo "Searching for: $SEARCH_TERM"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans/search?searchTerm=${SEARCH_TERM}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            RESULT_COUNT=$(echo "$BODY" | jq -r '.data | length')
+            echo ""
+            echo "Found $RESULT_COUNT matching loans"
+            echo "✅ TEST PASSED: Search loans"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Search loans"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 15: Test - Get Loan Statistics (GET)
+      # -----------------------------------------
+      - name: Test - Get Loan Statistics (GET)
+        id: test-statistics
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'statistics-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Get Loan Statistics (GET /api/loans/statistics)"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans/statistics")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            TOTAL_LOANS=$(echo "$BODY" | jq -r '.data.totalLoans')
+            TOTAL_AMOUNT=$(echo "$BODY" | jq -r '.data.totalLoanAmount')
+            echo ""
+            echo "Total Loans: $TOTAL_LOANS"
+            echo "Total Amount: $TOTAL_AMOUNT"
+            echo "✅ TEST PASSED: Get loan statistics"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get loan statistics"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 16: Test - Get Loans with Filters (GET)
+      # -----------------------------------------
+      - name: Test - Get Loans with Filters (GET)
+        id: test-filters
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'read-only' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Get Loans with Filters"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          # Test with status filter
+          echo "Testing with status filter (Pending=1)..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans?status=1&pageSize=5")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Get loans with status filter"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get loans with status filter"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+          echo ""
+          echo "Testing with loan type filter (Personal=1)..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans?type=1&pageSize=5")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Get loans with type filter"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Get loans with type filter"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 17: Test - Delete Loan (DELETE)
+      # -----------------------------------------
+      - name: Test - Delete Loan (DELETE)
+        id: test-delete
+        if: ${{ (github.event.inputs.test_type == 'all (Complete CRUD Test)' || github.event.inputs.test_type == 'delete-only') && github.event.inputs.cleanup_test_data == 'true' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Delete Loan (DELETE /api/loans/{id})"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+          LOAN_ID="${CREATED_LOAN_ID}"
+
+          if [ -z "$LOAN_ID" ]; then
+            echo "⚠️ No test loan ID found, skipping delete test"
+            exit 0
+          fi
+
+          echo "Deleting Loan ID: $LOAN_ID"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -X DELETE \
+            "${API_BASE}/loans/${LOAN_ID}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ TEST PASSED: Delete loan"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+            
+            # Verify deletion
+            echo ""
+            echo "Verifying deletion..."
+            VERIFY_RESPONSE=$(curl -s -w "\n%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "${API_BASE}/loans/${LOAN_ID}")
+            
+            VERIFY_CODE=$(echo "$VERIFY_RESPONSE" | tail -1)
+            
+            if [ "$VERIFY_CODE" == "404" ]; then
+              echo "✅ Deletion verified - loan not found (404)"
+            else
+              echo "⚠️ Unexpected response after deletion: $VERIFY_CODE"
+            fi
+          else
+            echo "❌ TEST FAILED: Delete loan"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 18: Test - Error Handling (404)
+      # -----------------------------------------
+      - name: Test - Error Handling (404)
+        id: test-error-404
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Error Handling - 404 Not Found"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${API_BASE}/loans/99999")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "404" ]; then
+            echo "✅ TEST PASSED: 404 error handling"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Expected 404, got $HTTP_CODE"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 19: Test - Error Handling (400)
+      # -----------------------------------------
+      - name: Test - Error Handling (400)
+        id: test-error-400
+        if: ${{ github.event.inputs.test_type == 'all (Complete CRUD Test)' }}
+        run: |
+          echo "=========================================="
+          echo "TEST: Error Handling - 400 Bad Request"
+          echo "=========================================="
+
+          API_BASE="${{ steps.get-url.outputs.api_base }}"
+
+          # Send invalid data
+          INVALID_DATA='{"applicantName": ""}'
+
+          echo "Sending invalid data:"
+          echo "$INVALID_DATA" | jq .
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$INVALID_DATA" \
+            "${API_BASE}/loans")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo ""
+          echo "Response Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" == "400" ]; then
+            echo "✅ TEST PASSED: 400 error handling"
+            echo "TESTS_PASSED=$((TESTS_PASSED + 1))" >> $GITHUB_ENV
+          else
+            echo "❌ TEST FAILED: Expected 400, got $HTTP_CODE"
+            echo "TESTS_FAILED=$((TESTS_FAILED + 1))" >> $GITHUB_ENV
+          fi
+
+      # -----------------------------------------
+      # Step 20: Test Summary
+      # -----------------------------------------
+      - name: Test Summary
+        id: summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "API Test Summary"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Application URL: ${{ steps.get-url.outputs.app_url }}"
+          echo "Test Type: ${{ github.event.inputs.test_type }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Test Results:"
+          echo "----------------------------------------"
+          echo "✅ Tests Passed: ${TESTS_PASSED}"
+          echo "❌ Tests Failed: ${TESTS_FAILED}"
+          echo ""
+
+          TOTAL_TESTS=$((TESTS_PASSED + TESTS_FAILED))
+
+          echo "tests_passed=${TESTS_PASSED}" >> $GITHUB_OUTPUT
+          echo "tests_failed=${TESTS_FAILED}" >> $GITHUB_OUTPUT
+
+          if [ "$TESTS_FAILED" -eq 0 ] && [ "$TESTS_PASSED" -gt 0 ]; then
+            echo "=========================================="
+            echo "✅ ALL TESTS PASSED! ($TESTS_PASSED/$TOTAL_TESTS)"
+            echo "=========================================="
+            echo "test_status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "=========================================="
+            echo "❌ SOME TESTS FAILED ($TESTS_FAILED/$TOTAL_TESTS failed)"
+            echo "=========================================="
+            echo "test_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo ""
+          echo "----------------------------------------"
+          echo "API Endpoints Tested:"
+          echo "----------------------------------------"
+          echo "• GET    /api/health"
+          echo "• POST   /api/loans"
+          echo "• GET    /api/loans"
+          echo "• GET    /api/loans/{id}"
+          echo "• GET    /api/loans/number/{loanNumber}"
+          echo "• PUT    /api/loans/{id}"
+          echo "• PATCH  /api/loans/{id}/status"
+          echo "• GET    /api/loans/search"
+          echo "• GET    /api/loans/statistics"
+          echo "• DELETE /api/loans/{id}"
+          echo ""

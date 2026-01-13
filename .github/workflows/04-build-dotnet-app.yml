@@ -1,0 +1,421 @@
+name: Build and Push - .NET Core Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - preprod
+          - prod
+      build_type:
+        description: "Build type"
+        required: true
+        type: choice
+        options:
+          - full (Build, Test, Push)
+          - build-only
+          - test-only
+          - push-only
+      image_tag:
+        description: "Custom image tag (optional, defaults to commit SHA)"
+        required: false
+        default: ""
+
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "LoanApplication.API/**"
+      - ".github/workflows/04-build-dotnet-app.yml"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: loan-application-api
+  DOTNET_VERSION: "8.0.x"
+  APP_NAME: loan-application
+
+jobs:
+  build-and-push:
+    name: Build & Push - ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      # -----------------------------------------
+      # Step 1: Checkout code
+      # -----------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------
+      # Step 2: Set environment variables
+      # -----------------------------------------
+      - name: Set environment variables
+        id: env-config
+        run: |
+          # Determine environment
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+
+          echo "ENVIRONMENT=$ENV" >> $GITHUB_OUTPUT
+          echo "Environment: $ENV"
+
+      # -----------------------------------------
+      # Step 3: Setup .NET SDK
+      # -----------------------------------------
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # -----------------------------------------
+      # Step 4: Cache NuGet packages
+      # -----------------------------------------
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # -----------------------------------------
+      # Step 5: Restore dependencies
+      # -----------------------------------------
+      - name: Restore dependencies
+        if: ${{ github.event.inputs.build_type != 'push-only' }}
+        working-directory: LoanApplication.API
+        run: |
+          echo "=========================================="
+          echo "Restoring NuGet packages..."
+          echo "=========================================="
+
+          dotnet restore
+
+          echo "✅ Dependencies restored!"
+
+      # -----------------------------------------
+      # Step 6: Build application
+      # -----------------------------------------
+      - name: Build application
+        if: ${{ github.event.inputs.build_type == 'full (Build, Test, Push)' || github.event.inputs.build_type == 'build-only' || github.event.inputs.build_type == '' }}
+        working-directory: LoanApplication.API
+        run: |
+          echo "=========================================="
+          echo "Building .NET application..."
+          echo "=========================================="
+
+          dotnet build --configuration Release --no-restore
+
+          echo "✅ Build completed!"
+
+      # -----------------------------------------
+      # Step 7: Run tests
+      # -----------------------------------------
+      - name: Run tests
+        if: ${{ github.event.inputs.build_type == 'full (Build, Test, Push)' || github.event.inputs.build_type == 'test-only' || github.event.inputs.build_type == '' }}
+        working-directory: LoanApplication.API
+        run: |
+          echo "=========================================="
+          echo "Running tests..."
+          echo "=========================================="
+
+          # Run tests if test project exists
+          if [ -f "../LoanApplication.Tests/LoanApplication.Tests.csproj" ]; then
+            dotnet test ../LoanApplication.Tests/LoanApplication.Tests.csproj \
+              --configuration Release \
+              --no-build \
+              --verbosity normal \
+              --logger "trx;LogFileName=test-results.trx" \
+              --collect:"XPlat Code Coverage"
+          else
+            echo "⚠️ No test project found, skipping tests"
+          fi
+
+          echo "✅ Tests completed!"
+
+      # -----------------------------------------
+      # Step 8: Publish application
+      # -----------------------------------------
+      - name: Publish application
+        if: ${{ github.event.inputs.build_type != 'test-only' }}
+        working-directory: LoanApplication.API
+        run: |
+          echo "=========================================="
+          echo "Publishing application..."
+          echo "=========================================="
+
+          dotnet publish \
+            --configuration Release \
+            --no-restore \
+            --output ./publish
+
+          echo "✅ Application published!"
+          echo ""
+          echo "Published files:"
+          ls -la ./publish/
+
+      # -----------------------------------------
+      # Step 9: Configure AWS credentials
+      # -----------------------------------------
+      - name: Configure AWS credentials
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------
+      # Step 10: Login to Amazon ECR
+      # -----------------------------------------
+      - name: Login to Amazon ECR
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------
+      # Step 11: Create ECR repository if not exists
+      # -----------------------------------------
+      - name: Create ECR repository
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        run: |
+          echo "=========================================="
+          echo "Checking ECR repository..."
+          echo "=========================================="
+
+          REPO_NAME="${{ env.ECR_REPOSITORY }}-${{ steps.env-config.outputs.ENVIRONMENT }}"
+
+          # Check if repository exists
+          if aws ecr describe-repositories --repository-names $REPO_NAME 2>/dev/null; then
+            echo "✅ Repository '$REPO_NAME' already exists"
+          else
+            echo "Creating repository '$REPO_NAME'..."
+            aws ecr create-repository \
+              --repository-name $REPO_NAME \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+            
+            # Set lifecycle policy to keep only last 10 images
+            aws ecr put-lifecycle-policy \
+              --repository-name $REPO_NAME \
+              --lifecycle-policy-text '{
+                "rules": [
+                  {
+                    "rulePriority": 1,
+                    "description": "Keep only last 10 images",
+                    "selection": {
+                      "tagStatus": "any",
+                      "countType": "imageCountMoreThan",
+                      "countNumber": 10
+                    },
+                    "action": {
+                      "type": "expire"
+                    }
+                  }
+                ]
+              }'
+            
+            echo "✅ Repository created!"
+          fi
+
+      # -----------------------------------------
+      # Step 12: Set up Docker Buildx
+      # -----------------------------------------
+      - name: Set up Docker Buildx
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------
+      # Step 13: Generate image metadata
+      # -----------------------------------------
+      - name: Generate image metadata
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        id: meta
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO_NAME="${{ env.ECR_REPOSITORY }}-${{ steps.env-config.outputs.ENVIRONMENT }}"
+
+          # Determine image tag
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          else
+            IMAGE_TAG="${{ github.sha }}"
+          fi
+
+          # Short SHA for additional tag
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+
+          # Timestamp tag
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          # Full image URIs
+          IMAGE_URI="${REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
+          IMAGE_URI_LATEST="${REGISTRY}/${REPO_NAME}:latest"
+          IMAGE_URI_SHORT="${REGISTRY}/${REPO_NAME}:${SHORT_SHA}"
+          IMAGE_URI_TIMESTAMP="${REGISTRY}/${REPO_NAME}:${TIMESTAMP}"
+
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "image_uri_latest=${IMAGE_URI_LATEST}" >> $GITHUB_OUTPUT
+          echo "image_uri_short=${IMAGE_URI_SHORT}" >> $GITHUB_OUTPUT
+          echo "image_uri_timestamp=${IMAGE_URI_TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
+          echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
+
+          echo "=========================================="
+          echo "Image Metadata:"
+          echo "=========================================="
+          echo "Registry: ${REGISTRY}"
+          echo "Repository: ${REPO_NAME}"
+          echo "Tag: ${IMAGE_TAG}"
+          echo "Full URI: ${IMAGE_URI}"
+
+      # -----------------------------------------
+      # Step 14: Build and push Docker image
+      # -----------------------------------------
+      - name: Build and push Docker image
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ./LoanApplication.API
+          file: ./LoanApplication.API/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+            ${{ steps.meta.outputs.image_uri_latest }}
+            ${{ steps.meta.outputs.image_uri_short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.title=Loan Application API
+            org.opencontainers.image.description=.NET Core Web API for loan management
+            org.opencontainers.image.version=${{ steps.meta.outputs.image_tag }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+
+      # -----------------------------------------
+      # Step 15: Scan image for vulnerabilities
+      # -----------------------------------------
+      - name: Scan image for vulnerabilities
+        if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Scanning image for vulnerabilities..."
+          echo "=========================================="
+
+          # Wait for scan to complete
+          sleep 10
+
+          # Get scan findings
+          aws ecr describe-image-scan-findings \
+            --repository-name ${{ steps.meta.outputs.repo_name }} \
+            --image-id imageTag=${{ steps.meta.outputs.image_tag }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output table 2>/dev/null || echo "⚠️ Scan still in progress or not available"
+
+      # -----------------------------------------
+      # Step 16: Build Summary
+      # -----------------------------------------
+      - name: Build Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ Build and Push Complete!"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ steps.env-config.outputs.ENVIRONMENT }}"
+          echo "Build Type: ${{ github.event.inputs.build_type || 'full' }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Image Details:"
+          echo "----------------------------------------"
+          echo "Registry: ${{ steps.meta.outputs.registry }}"
+          echo "Repository: ${{ steps.meta.outputs.repo_name }}"
+          echo "Tag: ${{ steps.meta.outputs.image_tag }}"
+          echo ""
+          echo "Image URIs:"
+          echo "  - ${{ steps.meta.outputs.image_uri }}"
+          echo "  - ${{ steps.meta.outputs.image_uri_latest }}"
+          echo "  - ${{ steps.meta.outputs.image_uri_short }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Git Info:"
+          echo "----------------------------------------"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Actor: ${{ github.actor }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Next Steps:"
+          echo "----------------------------------------"
+          echo "1. Run '05-deploy-dotnet-app' workflow to deploy to OpenShift"
+          echo "2. Use image: ${{ steps.meta.outputs.image_uri }}"
+          echo ""
+
+  # -----------------------------------------
+  # Job: Update deployment manifest (optional)
+  # -----------------------------------------
+  update-manifest:
+    name: Update Deployment Manifest
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.build_type != 'build-only' && github.event.inputs.build_type != 'test-only' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tag in manifests
+        run: |
+          echo "=========================================="
+          echo "Updating deployment manifests..."
+          echo "=========================================="
+
+          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+
+          # Update Kubernetes/OpenShift manifests if they exist
+          if [ -d "k8s" ]; then
+            find k8s -name "*.yaml" -o -name "*.yml" | while read file; do
+              if grep -q "image:" "$file"; then
+                echo "Updating $file..."
+                sed -i "s|image:.*loan-application.*|image: ${IMAGE_URI}|g" "$file"
+              fi
+            done
+            
+            echo "✅ Manifests updated!"
+          else
+            echo "⚠️ No k8s directory found, skipping manifest update"
+          fi
+
+      - name: Commit and push changes
+        continue-on-error: true
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: update image tag to ${{ needs.build-and-push.outputs.image_tag }}"
+          git push || echo "⚠️ Nothing to push or push failed"

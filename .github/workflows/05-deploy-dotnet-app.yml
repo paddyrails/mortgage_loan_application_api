@@ -1,0 +1,619 @@
+name: Deploy - .NET Core Application to OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select deployment environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - preprod
+          - prod
+      cluster_name:
+        description: "ROSA Cluster Name"
+        required: true
+        default: "loan-app-cluster"
+      image_tag:
+        description: "Image tag to deploy (defaults to latest)"
+        required: false
+        default: "latest"
+      replicas:
+        description: "Number of replicas"
+        required: false
+        default: "2"
+      deployment_strategy:
+        description: "Deployment strategy"
+        required: true
+        type: choice
+        options:
+          - rolling-update
+          - recreate
+          - blue-green
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}-${{ github.event.inputs.environment }}
+  NAMESPACE: loan-app-${{ github.event.inputs.environment }}
+  APP_NAME: loan-application
+  ECR_REPOSITORY: loan-application-api
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: ${{ steps.get-route.outputs.app_url }}
+
+    steps:
+      # -----------------------------------------
+      # Step 1: Checkout code
+      # -----------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------
+      # Step 2: Set environment-specific variables
+      # -----------------------------------------
+      - name: Set environment variables
+        id: env-config
+        run: |
+          case "${{ github.event.inputs.environment }}" in
+            dev)
+              echo "REPLICAS=${{ github.event.inputs.replicas || '1' }}" >> $GITHUB_OUTPUT
+              echo "CPU_REQUEST=100m" >> $GITHUB_OUTPUT
+              echo "CPU_LIMIT=500m" >> $GITHUB_OUTPUT
+              echo "MEMORY_REQUEST=128Mi" >> $GITHUB_OUTPUT
+              echo "MEMORY_LIMIT=512Mi" >> $GITHUB_OUTPUT
+              ;;
+            qa)
+              echo "REPLICAS=${{ github.event.inputs.replicas || '2' }}" >> $GITHUB_OUTPUT
+              echo "CPU_REQUEST=200m" >> $GITHUB_OUTPUT
+              echo "CPU_LIMIT=1000m" >> $GITHUB_OUTPUT
+              echo "MEMORY_REQUEST=256Mi" >> $GITHUB_OUTPUT
+              echo "MEMORY_LIMIT=1Gi" >> $GITHUB_OUTPUT
+              ;;
+            preprod)
+              echo "REPLICAS=${{ github.event.inputs.replicas || '2' }}" >> $GITHUB_OUTPUT
+              echo "CPU_REQUEST=500m" >> $GITHUB_OUTPUT
+              echo "CPU_LIMIT=2000m" >> $GITHUB_OUTPUT
+              echo "MEMORY_REQUEST=512Mi" >> $GITHUB_OUTPUT
+              echo "MEMORY_LIMIT=2Gi" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              echo "REPLICAS=${{ github.event.inputs.replicas || '3' }}" >> $GITHUB_OUTPUT
+              echo "CPU_REQUEST=1000m" >> $GITHUB_OUTPUT
+              echo "CPU_LIMIT=4000m" >> $GITHUB_OUTPUT
+              echo "MEMORY_REQUEST=1Gi" >> $GITHUB_OUTPUT
+              echo "MEMORY_LIMIT=4Gi" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      # -----------------------------------------
+      # Step 3: Configure AWS Credentials
+      # -----------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------
+      # Step 4: Get ECR Image URI
+      # -----------------------------------------
+      - name: Get ECR Image URI
+        id: ecr-image
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          IMAGE_URI="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}-${{ github.event.inputs.environment }}:${IMAGE_TAG}"
+
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+
+          echo "Image URI: ${IMAGE_URI}"
+
+      # -----------------------------------------
+      # Step 5: Install OpenShift CLI
+      # -----------------------------------------
+      - name: Install OpenShift CLI
+        run: |
+          echo "=========================================="
+          echo "Installing OpenShift CLI..."
+          echo "=========================================="
+
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          oc version --client
+
+          echo "✅ OpenShift CLI installed!"
+
+      # -----------------------------------------
+      # Step 6: Install ROSA CLI and Login
+      # -----------------------------------------
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xzf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+          echo "✅ ROSA CLI ready!"
+
+      # -----------------------------------------
+      # Step 7: Login to OpenShift Cluster
+      # -----------------------------------------
+      - name: Login to OpenShift Cluster
+        run: |
+          echo "=========================================="
+          echo "Logging in to OpenShift Cluster..."
+          echo "=========================================="
+
+          # Get cluster API URL
+          API_URL=$(rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} --output json | jq -r '.api.url')
+
+          echo "Cluster API: $API_URL"
+
+          # Login to cluster
+          oc login $API_URL \
+            --username=${{ secrets.OPENSHIFT_ADMIN_USER }} \
+            --password=${{ secrets.OPENSHIFT_ADMIN_PASSWORD }} \
+            --insecure-skip-tls-verify=true
+
+          echo "✅ Logged in to OpenShift!"
+          oc whoami
+
+      # -----------------------------------------
+      # Step 8: Switch to namespace
+      # -----------------------------------------
+      - name: Switch to namespace
+        run: |
+          echo "Switching to namespace: ${{ env.NAMESPACE }}"
+          oc project ${{ env.NAMESPACE }}
+
+      # -----------------------------------------
+      # Step 9: Update ECR pull secret
+      # -----------------------------------------
+      - name: Update ECR pull secret
+        run: |
+          echo "=========================================="
+          echo "Updating ECR pull secret..."
+          echo "=========================================="
+
+          # Get fresh ECR credentials
+          ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+
+          # Delete old secret if exists and create new one
+          oc delete secret ecr-pull-secret -n ${{ env.NAMESPACE }} --ignore-not-found
+
+          oc create secret docker-registry ecr-pull-secret \
+            --docker-server=${{ steps.ecr-image.outputs.ecr_registry }} \
+            --docker-username=AWS \
+            --docker-password=${ECR_PASSWORD} \
+            --namespace=${{ env.NAMESPACE }}
+
+          # Link to default service account
+          oc secrets link default ecr-pull-secret --for=pull -n ${{ env.NAMESPACE }}
+          oc secrets link ${{ env.APP_NAME }}-sa ecr-pull-secret --for=pull -n ${{ env.NAMESPACE }} || true
+
+          echo "✅ ECR pull secret updated!"
+
+      # -----------------------------------------
+      # Step 10: Create/Update ConfigMap
+      # -----------------------------------------
+      - name: Create/Update ConfigMap
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating ConfigMap..."
+          echo "=========================================="
+
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${{ env.APP_NAME }}-config
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+          data:
+            ASPNETCORE_ENVIRONMENT: "${{ github.event.inputs.environment }}"
+            ASPNETCORE_URLS: "http://+:8080"
+            Logging__LogLevel__Default: "Information"
+            Logging__LogLevel__Microsoft: "Warning"
+            Logging__LogLevel__Microsoft.Hosting.Lifetime: "Information"
+            AllowedHosts: "*"
+          EOF
+
+          echo "✅ ConfigMap applied!"
+
+      # -----------------------------------------
+      # Step 11: Create/Update Deployment
+      # -----------------------------------------
+      - name: Create/Update Deployment
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating Deployment..."
+          echo "=========================================="
+
+          # Set deployment strategy
+          if [ "${{ github.event.inputs.deployment_strategy }}" == "recreate" ]; then
+            STRATEGY_TYPE="Recreate"
+            STRATEGY_SPEC=""
+          else
+            STRATEGY_TYPE="RollingUpdate"
+            STRATEGY_SPEC="
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0"
+          fi
+
+          cat <<EOF | oc apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+              version: "${{ github.event.inputs.image_tag || 'latest' }}"
+            annotations:
+              kubernetes.io/change-cause: "Deployed via GitHub Actions - ${{ github.sha }}"
+          spec:
+            replicas: ${{ steps.env-config.outputs.REPLICAS }}
+            selector:
+              matchLabels:
+                app: ${{ env.APP_NAME }}
+            strategy:
+              type: ${STRATEGY_TYPE}
+              ${STRATEGY_SPEC}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.APP_NAME }}
+                  environment: ${{ github.event.inputs.environment }}
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8080"
+                  prometheus.io/path: "/health"
+              spec:
+                serviceAccountName: ${{ env.APP_NAME }}-sa
+                imagePullSecrets:
+                  - name: ecr-pull-secret
+                containers:
+                  - name: ${{ env.APP_NAME }}
+                    image: ${{ steps.ecr-image.outputs.image_uri }}
+                    imagePullPolicy: Always
+                    ports:
+                      - name: http
+                        containerPort: 8080
+                        protocol: TCP
+                    envFrom:
+                      - configMapRef:
+                          name: ${{ env.APP_NAME }}-config
+                      - secretRef:
+                          name: ${{ env.APP_NAME }}-app-secret
+                          optional: true
+                    env:
+                      - name: POD_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                      - name: POD_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+                    resources:
+                      requests:
+                        cpu: ${{ steps.env-config.outputs.CPU_REQUEST }}
+                        memory: ${{ steps.env-config.outputs.MEMORY_REQUEST }}
+                      limits:
+                        cpu: ${{ steps.env-config.outputs.CPU_LIMIT }}
+                        memory: ${{ steps.env-config.outputs.MEMORY_LIMIT }}
+                    livenessProbe:
+                      httpGet:
+                        path: /api/health/live
+                        port: 8080
+                      initialDelaySeconds: 10
+                      periodSeconds: 15
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /api/health/ready
+                        port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    startupProbe:
+                      httpGet:
+                        path: /api/health/startup
+                        port: 8080
+                      initialDelaySeconds: 0
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 30
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      runAsNonRoot: true
+                      capabilities:
+                        drop:
+                          - ALL
+                restartPolicy: Always
+                terminationGracePeriodSeconds: 30
+          EOF
+
+          echo "✅ Deployment applied!"
+
+      # -----------------------------------------
+      # Step 12: Create/Update Service
+      # -----------------------------------------
+      - name: Create/Update Service
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating Service..."
+          echo "=========================================="
+
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+          spec:
+            type: ClusterIP
+            selector:
+              app: ${{ env.APP_NAME }}
+            ports:
+              - name: http
+                port: 80
+                targetPort: 8080
+                protocol: TCP
+          EOF
+
+          echo "✅ Service applied!"
+
+      # -----------------------------------------
+      # Step 13: Create/Update Route (OpenShift specific)
+      # -----------------------------------------
+      - name: Create/Update Route
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating Route..."
+          echo "=========================================="
+
+          cat <<EOF | oc apply -f -
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: ${{ env.APP_NAME }}
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+            annotations:
+              haproxy.router.openshift.io/timeout: 60s
+          spec:
+            to:
+              kind: Service
+              name: ${{ env.APP_NAME }}
+              weight: 100
+            port:
+              targetPort: http
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+            wildcardPolicy: None
+          EOF
+
+          echo "✅ Route applied!"
+
+      # -----------------------------------------
+      # Step 14: Create HorizontalPodAutoscaler
+      # -----------------------------------------
+      - name: Create/Update HPA
+        if: ${{ github.event.inputs.environment == 'prod' || github.event.inputs.environment == 'preprod' }}
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating HorizontalPodAutoscaler..."
+          echo "=========================================="
+
+          MAX_REPLICAS=10
+          if [ "${{ github.event.inputs.environment }}" == "preprod" ]; then
+            MAX_REPLICAS=5
+          fi
+
+          cat <<EOF | oc apply -f -
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: ${{ env.APP_NAME }}-hpa
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: ${{ env.APP_NAME }}
+            minReplicas: ${{ steps.env-config.outputs.REPLICAS }}
+            maxReplicas: ${MAX_REPLICAS}
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 70
+              - type: Resource
+                resource:
+                  name: memory
+                  target:
+                    type: Utilization
+                    averageUtilization: 80
+            behavior:
+              scaleDown:
+                stabilizationWindowSeconds: 300
+                policies:
+                  - type: Percent
+                    value: 10
+                    periodSeconds: 60
+              scaleUp:
+                stabilizationWindowSeconds: 0
+                policies:
+                  - type: Percent
+                    value: 100
+                    periodSeconds: 15
+                  - type: Pods
+                    value: 4
+                    periodSeconds: 15
+                selectPolicy: Max
+          EOF
+
+          echo "✅ HPA applied!"
+
+      # -----------------------------------------
+      # Step 15: Create PodDisruptionBudget
+      # -----------------------------------------
+      - name: Create/Update PDB
+        if: ${{ github.event.inputs.environment == 'prod' || github.event.inputs.environment == 'preprod' }}
+        run: |
+          echo "=========================================="
+          echo "Creating/Updating PodDisruptionBudget..."
+          echo "=========================================="
+
+          cat <<EOF | oc apply -f -
+          apiVersion: policy/v1
+          kind: PodDisruptionBudget
+          metadata:
+            name: ${{ env.APP_NAME }}-pdb
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                app: ${{ env.APP_NAME }}
+          EOF
+
+          echo "✅ PDB applied!"
+
+      # -----------------------------------------
+      # Step 16: Wait for deployment rollout
+      # -----------------------------------------
+      - name: Wait for deployment rollout
+        run: |
+          echo "=========================================="
+          echo "Waiting for deployment rollout..."
+          echo "=========================================="
+
+          oc rollout status deployment/${{ env.APP_NAME }} \
+            --namespace=${{ env.NAMESPACE }} \
+            --timeout=300s
+
+          echo "✅ Deployment rollout complete!"
+
+      # -----------------------------------------
+      # Step 17: Get application URL
+      # -----------------------------------------
+      - name: Get application URL
+        id: get-route
+        run: |
+          echo "=========================================="
+          echo "Getting application URL..."
+          echo "=========================================="
+
+          # Wait for route to be ready
+          sleep 5
+
+          APP_URL=$(oc get route ${{ env.APP_NAME }} \
+            --namespace=${{ env.NAMESPACE }} \
+            -o jsonpath='{.spec.host}')
+
+          echo "app_url=https://${APP_URL}" >> $GITHUB_OUTPUT
+          echo "Application URL: https://${APP_URL}"
+
+      # -----------------------------------------
+      # Step 18: Verify deployment
+      # -----------------------------------------
+      - name: Verify deployment
+        run: |
+          echo "=========================================="
+          echo "Verifying deployment..."
+          echo "=========================================="
+
+          echo "Pods:"
+          oc get pods -n ${{ env.NAMESPACE }} -l app=${{ env.APP_NAME }} -o wide
+
+          echo ""
+          echo "Deployment:"
+          oc get deployment ${{ env.APP_NAME }} -n ${{ env.NAMESPACE }}
+
+          echo ""
+          echo "Service:"
+          oc get svc ${{ env.APP_NAME }} -n ${{ env.NAMESPACE }}
+
+          echo ""
+          echo "Route:"
+          oc get route ${{ env.APP_NAME }} -n ${{ env.NAMESPACE }}
+
+          echo ""
+          echo "Events:"
+          oc get events -n ${{ env.NAMESPACE }} --sort-by='.lastTimestamp' | tail -10
+
+      # -----------------------------------------
+      # Step 19: Deployment Summary
+      # -----------------------------------------
+      - name: Deployment Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ Deployment Complete!"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Cluster: ${{ env.CLUSTER_NAME }}"
+          echo "Namespace: ${{ env.NAMESPACE }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Application Details:"
+          echo "----------------------------------------"
+          echo "App Name: ${{ env.APP_NAME }}"
+          echo "Image: ${{ steps.ecr-image.outputs.image_uri }}"
+          echo "Replicas: ${{ steps.env-config.outputs.REPLICAS }}"
+          echo "Strategy: ${{ github.event.inputs.deployment_strategy }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "URLs:"
+          echo "----------------------------------------"
+          echo "Application: ${{ steps.get-route.outputs.app_url }}"
+          echo "Swagger UI: ${{ steps.get-route.outputs.app_url }}/swagger"
+          echo "Health Check: ${{ steps.get-route.outputs.app_url }}/api/health"
+          echo ""
+          echo "----------------------------------------"
+          echo "Resources:"
+          echo "----------------------------------------"
+          echo "CPU Request: ${{ steps.env-config.outputs.CPU_REQUEST }}"
+          echo "CPU Limit: ${{ steps.env-config.outputs.CPU_LIMIT }}"
+          echo "Memory Request: ${{ steps.env-config.outputs.MEMORY_REQUEST }}"
+          echo "Memory Limit: ${{ steps.env-config.outputs.MEMORY_LIMIT }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Next Steps:"
+          echo "----------------------------------------"
+          echo "1. Run '06-verify-healthcheck' workflow to verify health"
+          echo "2. Run '07-invoke-api' workflow to test API endpoints"
+          echo ""

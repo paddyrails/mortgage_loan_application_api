@@ -1,0 +1,552 @@
+name: OpenShift Setup - Create Namespace
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - preprod
+          - prod
+      cluster_name:
+        description: "ROSA Cluster Name"
+        required: true
+        default: "loan-app-cluster"
+      setup_type:
+        description: "Select setup to run"
+        required: true
+        type: choice
+        options:
+          - all (Complete Setup)
+          - create-namespace-only
+          - configure-rbac-only
+          - create-secrets-only
+          - configure-resource-quotas-only
+          - configure-network-policies-only
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}-${{ github.event.inputs.environment }}
+  NAMESPACE: loan-app-${{ github.event.inputs.environment }}
+  APP_NAME: loan-application
+
+jobs:
+  namespace-setup:
+    name: Namespace Setup - ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------
+      # Step 1: Checkout code
+      # -----------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------
+      # Step 2: Configure AWS Credentials
+      # -----------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------
+      # Step 3: Install OpenShift CLI
+      # -----------------------------------------
+      - name: Install OpenShift CLI
+        run: |
+          echo "=========================================="
+          echo "Installing OpenShift CLI..."
+          echo "=========================================="
+
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          oc version --client
+
+          echo "✅ OpenShift CLI installed!"
+
+      # -----------------------------------------
+      # Step 4: Install ROSA CLI and Login
+      # -----------------------------------------
+      - name: Install ROSA CLI and Login
+        run: |
+          echo "=========================================="
+          echo "Installing ROSA CLI..."
+          echo "=========================================="
+
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xzf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+          echo ""
+          echo "Logging in to ROSA..."
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+          echo "✅ ROSA CLI ready!"
+
+      # -----------------------------------------
+      # Step 5: Login to OpenShift Cluster
+      # -----------------------------------------
+      - name: Login to OpenShift Cluster
+        run: |
+          echo "=========================================="
+          echo "Logging in to OpenShift Cluster..."
+          echo "=========================================="
+
+          # Get cluster API URL
+          API_URL=$(rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} --output json | jq -r '.api.url')
+
+          echo "Cluster API: $API_URL"
+
+          # Login using the cluster admin credentials
+          oc login $API_URL \
+            --username=${{ secrets.OPENSHIFT_ADMIN_USER }} \
+            --password=${{ secrets.OPENSHIFT_ADMIN_PASSWORD }} \
+            --insecure-skip-tls-verify=true
+
+          echo ""
+          echo "✅ Logged in to OpenShift cluster!"
+          oc whoami
+          oc cluster-info
+
+      # -----------------------------------------
+      # Step 6: Create Namespace/Project
+      # -----------------------------------------
+      - name: Create Namespace
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' || github.event.inputs.setup_type == 'create-namespace-only' }}
+        run: |
+          echo "=========================================="
+          echo "Creating Namespace: ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          # Check if namespace exists
+          if oc get namespace ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ Namespace '${{ env.NAMESPACE }}' already exists"
+          else
+            echo "Creating namespace '${{ env.NAMESPACE }}'..."
+            
+            # Create namespace with labels
+            cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+              environment: ${{ github.event.inputs.environment }}
+              managed-by: github-actions
+            annotations:
+              openshift.io/description: "Loan Application - ${{ github.event.inputs.environment }} environment"
+              openshift.io/display-name: "Loan App (${{ github.event.inputs.environment }})"
+          EOF
+            
+            echo "✅ Namespace created!"
+          fi
+
+          # Switch to the namespace
+          oc project ${{ env.NAMESPACE }}
+
+      # -----------------------------------------
+      # Step 7: Configure RBAC
+      # -----------------------------------------
+      - name: Configure RBAC
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' || github.event.inputs.setup_type == 'configure-rbac-only' }}
+        run: |
+          echo "=========================================="
+          echo "Configuring RBAC for ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          # Create Service Account for the application
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ${{ env.APP_NAME }}-sa
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          EOF
+
+          echo "✅ Service Account created!"
+
+          # Create Role for the application
+          cat <<EOF | oc apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: ${{ env.APP_NAME }}-role
+            namespace: ${{ env.NAMESPACE }}
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "services", "configmaps", "secrets"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["pods/log", "pods/exec"]
+              verbs: ["get", "create"]
+            - apiGroups: ["apps"]
+              resources: ["deployments", "replicasets"]
+              verbs: ["get", "list", "watch"]
+          EOF
+
+          echo "✅ Role created!"
+
+          # Create RoleBinding
+          cat <<EOF | oc apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: ${{ env.APP_NAME }}-rolebinding
+            namespace: ${{ env.NAMESPACE }}
+          subjects:
+            - kind: ServiceAccount
+              name: ${{ env.APP_NAME }}-sa
+              namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: Role
+            name: ${{ env.APP_NAME }}-role
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+          echo "✅ RoleBinding created!"
+
+          # Create ClusterRoleBinding for image pulling (if using internal registry)
+          cat <<EOF | oc apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: ${{ env.APP_NAME }}-image-puller
+            namespace: ${{ env.NAMESPACE }}
+          subjects:
+            - kind: ServiceAccount
+              name: ${{ env.APP_NAME }}-sa
+              namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: ClusterRole
+            name: system:image-puller
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+          echo "✅ RBAC configuration complete!"
+
+      # -----------------------------------------
+      # Step 8: Create Application Secrets
+      # -----------------------------------------
+      - name: Create Secrets
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' || github.event.inputs.setup_type == 'create-secrets-only' }}
+        run: |
+          echo "=========================================="
+          echo "Creating Secrets for ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          # Create database connection secret
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ${{ env.APP_NAME }}-db-secret
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          type: Opaque
+          stringData:
+            ConnectionStrings__DefaultConnection: "${{ secrets.DB_CONNECTION_STRING }}"
+            DB_HOST: "${{ secrets.DB_HOST }}"
+            DB_PORT: "${{ secrets.DB_PORT }}"
+            DB_NAME: "${{ secrets.DB_NAME }}"
+            DB_USER: "${{ secrets.DB_USER }}"
+            DB_PASSWORD: "${{ secrets.DB_PASSWORD }}"
+          EOF
+
+          echo "✅ Database secret created!"
+
+          # Create application secrets
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ${{ env.APP_NAME }}-app-secret
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          type: Opaque
+          stringData:
+            JWT_SECRET: "${{ secrets.JWT_SECRET }}"
+            API_KEY: "${{ secrets.API_KEY }}"
+          EOF
+
+          echo "✅ Application secrets created!"
+
+          # Create image pull secret for ECR (if using AWS ECR)
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+
+          oc create secret docker-registry ecr-pull-secret \
+            --docker-server=${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com \
+            --docker-username=AWS \
+            --docker-password=${ECR_PASSWORD} \
+            --namespace=${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | oc apply -f -
+
+          # Link secret to service account
+          oc secrets link ${{ env.APP_NAME }}-sa ecr-pull-secret --for=pull -n ${{ env.NAMESPACE }}
+
+          echo "✅ ECR pull secret created and linked!"
+
+      # -----------------------------------------
+      # Step 9: Configure Resource Quotas
+      # -----------------------------------------
+      - name: Configure Resource Quotas
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' || github.event.inputs.setup_type == 'configure-resource-quotas-only' }}
+        run: |
+          echo "=========================================="
+          echo "Configuring Resource Quotas for ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          # Set quotas based on environment
+          case "${{ github.event.inputs.environment }}" in
+            dev)
+              CPU_REQUEST="2"
+              CPU_LIMIT="4"
+              MEMORY_REQUEST="2Gi"
+              MEMORY_LIMIT="4Gi"
+              PODS="10"
+              ;;
+            qa)
+              CPU_REQUEST="4"
+              CPU_LIMIT="8"
+              MEMORY_REQUEST="4Gi"
+              MEMORY_LIMIT="8Gi"
+              PODS="20"
+              ;;
+            preprod)
+              CPU_REQUEST="8"
+              CPU_LIMIT="16"
+              MEMORY_REQUEST="8Gi"
+              MEMORY_LIMIT="16Gi"
+              PODS="30"
+              ;;
+            prod)
+              CPU_REQUEST="16"
+              CPU_LIMIT="32"
+              MEMORY_REQUEST="16Gi"
+              MEMORY_LIMIT="32Gi"
+              PODS="50"
+              ;;
+          esac
+
+          # Create ResourceQuota
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: ${{ env.APP_NAME }}-quota
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            hard:
+              requests.cpu: "${CPU_REQUEST}"
+              requests.memory: "${MEMORY_REQUEST}"
+              limits.cpu: "${CPU_LIMIT}"
+              limits.memory: "${MEMORY_LIMIT}"
+              pods: "${PODS}"
+              services: "10"
+              secrets: "20"
+              configmaps: "20"
+              persistentvolumeclaims: "5"
+          EOF
+
+          echo "✅ Resource Quota created!"
+
+          # Create LimitRange for default container limits
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: ${{ env.APP_NAME }}-limit-range
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            limits:
+              - type: Container
+                default:
+                  cpu: "500m"
+                  memory: "512Mi"
+                defaultRequest:
+                  cpu: "100m"
+                  memory: "128Mi"
+                max:
+                  cpu: "2"
+                  memory: "2Gi"
+                min:
+                  cpu: "50m"
+                  memory: "64Mi"
+              - type: Pod
+                max:
+                  cpu: "4"
+                  memory: "4Gi"
+          EOF
+
+          echo "✅ Limit Range created!"
+
+      # -----------------------------------------
+      # Step 10: Configure Network Policies
+      # -----------------------------------------
+      - name: Configure Network Policies
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' || github.event.inputs.setup_type == 'configure-network-policies-only' }}
+        run: |
+          echo "=========================================="
+          echo "Configuring Network Policies for ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          # Default deny all ingress traffic
+          cat <<EOF | oc apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: default-deny-ingress
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+          EOF
+
+          echo "✅ Default deny policy created!"
+
+          # Allow ingress from OpenShift router (for external access)
+          cat <<EOF | oc apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-from-openshift-ingress
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            podSelector: {}
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        network.openshift.io/policy-group: ingress
+            policyTypes:
+              - Ingress
+          EOF
+
+          echo "✅ Ingress policy created!"
+
+          # Allow internal pod-to-pod communication within namespace
+          cat <<EOF | oc apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-same-namespace
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            podSelector: {}
+            ingress:
+              - from:
+                  - podSelector: {}
+            policyTypes:
+              - Ingress
+          EOF
+
+          echo "✅ Same-namespace policy created!"
+
+          # Allow monitoring from OpenShift monitoring namespace
+          cat <<EOF | oc apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-monitoring
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            podSelector: {}
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        network.openshift.io/policy-group: monitoring
+            policyTypes:
+              - Ingress
+          EOF
+
+          echo "✅ Monitoring policy created!"
+
+      # -----------------------------------------
+      # Step 11: Create ConfigMap for Application
+      # -----------------------------------------
+      - name: Create ConfigMap
+        if: ${{ github.event.inputs.setup_type == 'all (Complete Setup)' }}
+        run: |
+          echo "=========================================="
+          echo "Creating ConfigMap for ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          cat <<EOF | oc apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${{ env.APP_NAME }}-config
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: ${{ env.APP_NAME }}
+          data:
+            ASPNETCORE_ENVIRONMENT: "${{ github.event.inputs.environment }}"
+            ASPNETCORE_URLS: "http://+:8080"
+            Logging__LogLevel__Default: "Information"
+            Logging__LogLevel__Microsoft: "Warning"
+            Logging__LogLevel__Microsoft.Hosting.Lifetime: "Information"
+            AllowedHosts: "*"
+          EOF
+
+          echo "✅ ConfigMap created!"
+
+      # -----------------------------------------
+      # Step 12: Setup Summary
+      # -----------------------------------------
+      - name: Setup Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ Namespace Setup Complete!"
+          echo "=========================================="
+          echo ""
+          echo "Cluster: ${{ env.CLUSTER_NAME }}"
+          echo "Namespace: ${{ env.NAMESPACE }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Setup Type: ${{ github.event.inputs.setup_type }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Resources Created:"
+          echo "----------------------------------------"
+          echo ""
+          echo "📁 Namespace:"
+          oc get namespace ${{ env.NAMESPACE }} -o wide 2>/dev/null || echo "  (not found)"
+          echo ""
+          echo "👤 Service Accounts:"
+          oc get serviceaccounts -n ${{ env.NAMESPACE }} 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "🔐 Secrets:"
+          oc get secrets -n ${{ env.NAMESPACE }} --field-selector type!=kubernetes.io/service-account-token 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "📋 ConfigMaps:"
+          oc get configmaps -n ${{ env.NAMESPACE }} 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "📊 Resource Quotas:"
+          oc get resourcequotas -n ${{ env.NAMESPACE }} 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "🌐 Network Policies:"
+          oc get networkpolicies -n ${{ env.NAMESPACE }} 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "----------------------------------------"
+          echo "Next Steps:"
+          echo "----------------------------------------"
+          echo "1. Run '03-create-dotnet-app' to scaffold the .NET Core application"
+          echo "2. Run '04-build-dotnet-app' to build and push Docker image"
+          echo "3. Run '05-deploy-dotnet-app' to deploy to OpenShift"
+          echo ""

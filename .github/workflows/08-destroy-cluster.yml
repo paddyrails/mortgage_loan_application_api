@@ -1,0 +1,584 @@
+name: Destroy - OpenShift Cluster (ROSA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment to destroy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - preprod
+          - prod
+      cluster_name:
+        description: "ROSA Cluster Name"
+        required: true
+        default: "loan-app-cluster"
+      destroy_type:
+        description: "What to destroy"
+        required: true
+        type: choice
+        options:
+          - all (Complete Teardown)
+          - cluster-only
+          - namespace-only
+          - ecr-only
+          - vpc-only
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm'
+        required: true
+        default: ""
+      backup_before_destroy:
+        description: "Backup resources before destroying"
+        required: true
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}-${{ github.event.inputs.environment }}
+  NAMESPACE: loan-app-${{ github.event.inputs.environment }}
+  APP_NAME: loan-application
+  ECR_REPOSITORY: loan-application-api
+
+jobs:
+  # -----------------------------------------
+  # Job 1: Validation
+  # -----------------------------------------
+  validate:
+    name: Validate Destruction Request
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.validate.outputs.proceed }}
+
+    steps:
+      - name: Validate confirmation
+        id: validate
+        run: |
+          echo "=========================================="
+          echo "Validating Destruction Request"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Cluster: ${{ env.CLUSTER_NAME }}"
+          echo "Destroy Type: ${{ github.event.inputs.destroy_type }}"
+          echo "Confirmation: ${{ github.event.inputs.confirm_destroy }}"
+          echo ""
+
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ DESTRUCTION CANCELLED"
+            echo ""
+            echo "You must type 'DESTROY' in the confirmation field to proceed."
+            echo "This is a safety measure to prevent accidental destruction."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Additional warning for production
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "⚠️ WARNING: You are about to destroy a PRODUCTION environment!"
+            echo ""
+            echo "This action is IRREVERSIBLE and will:"
+            echo "  - Delete all running applications"
+            echo "  - Remove all data and configurations"
+            echo "  - Terminate all associated AWS resources"
+            echo ""
+          fi
+
+          echo "✅ Confirmation validated. Proceeding with destruction..."
+          echo "proceed=true" >> $GITHUB_OUTPUT
+
+  # -----------------------------------------
+  # Job 2: Backup (Optional)
+  # -----------------------------------------
+  backup:
+    name: Backup Resources
+    needs: validate
+    if: ${{ needs.validate.outputs.proceed == 'true' && github.event.inputs.backup_before_destroy == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install CLI Tools
+        run: |
+          # Install OpenShift CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+          # Install ROSA CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xzf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+      - name: Login to OpenShift
+        continue-on-error: true
+        run: |
+          API_URL=$(rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} --output json 2>/dev/null | jq -r '.api.url' || echo "")
+
+          if [ -n "$API_URL" ] && [ "$API_URL" != "null" ]; then
+            oc login $API_URL \
+              --username=${{ secrets.OPENSHIFT_ADMIN_USER }} \
+              --password=${{ secrets.OPENSHIFT_ADMIN_PASSWORD }} \
+              --insecure-skip-tls-verify=true || echo "Could not login to cluster"
+          else
+            echo "Cluster not found or not accessible"
+          fi
+
+      - name: Backup namespace resources
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Backing up namespace resources..."
+          echo "=========================================="
+
+          BACKUP_DIR="backup-${{ env.NAMESPACE }}-$(date +%Y%m%d-%H%M%S)"
+          mkdir -p $BACKUP_DIR
+
+          # Check if we can access the namespace
+          if oc get namespace ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "Backing up deployments..."
+            oc get deployments -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/deployments.yaml 2>/dev/null || true
+            
+            echo "Backing up services..."
+            oc get services -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/services.yaml 2>/dev/null || true
+            
+            echo "Backing up configmaps..."
+            oc get configmaps -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/configmaps.yaml 2>/dev/null || true
+            
+            echo "Backing up routes..."
+            oc get routes -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/routes.yaml 2>/dev/null || true
+            
+            echo "Backing up secrets (metadata only)..."
+            oc get secrets -n ${{ env.NAMESPACE }} -o yaml > $BACKUP_DIR/secrets-metadata.yaml 2>/dev/null || true
+            
+            echo ""
+            echo "Backup contents:"
+            ls -la $BACKUP_DIR/
+            
+            # Create backup archive
+            tar -czf ${BACKUP_DIR}.tar.gz $BACKUP_DIR
+            echo ""
+            echo "✅ Backup archive created: ${BACKUP_DIR}.tar.gz"
+          else
+            echo "⚠️ Namespace not accessible, skipping backup"
+          fi
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: cluster-backup-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: backup-*.tar.gz
+          retention-days: 30
+
+  # -----------------------------------------
+  # Job 3: Destroy Resources
+  # -----------------------------------------
+  destroy:
+    name: Destroy - ${{ github.event.inputs.destroy_type }}
+    needs: [validate, backup]
+    if: |
+      always() && 
+      needs.validate.outputs.proceed == 'true' && 
+      (needs.backup.result == 'success' || needs.backup.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install CLI Tools
+        run: |
+          # Install OpenShift CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+          # Install ROSA CLI
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xzf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+          # Install jq
+          sudo apt-get update && sudo apt-get install -y jq
+
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+          echo "✅ CLI tools installed!"
+
+      - name: Login to OpenShift
+        id: oc-login
+        continue-on-error: true
+        run: |
+          API_URL=$(rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} --output json 2>/dev/null | jq -r '.api.url' || echo "")
+
+          if [ -n "$API_URL" ] && [ "$API_URL" != "null" ]; then
+            oc login $API_URL \
+              --username=${{ secrets.OPENSHIFT_ADMIN_USER }} \
+              --password=${{ secrets.OPENSHIFT_ADMIN_PASSWORD }} \
+              --insecure-skip-tls-verify=true
+            echo "logged_in=true" >> $GITHUB_OUTPUT
+          else
+            echo "Cluster not found or not accessible"
+            echo "logged_in=false" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------
+      # Delete Namespace
+      # -----------------------------------------
+      - name: Delete Namespace
+        if: ${{ github.event.inputs.destroy_type == 'all (Complete Teardown)' || github.event.inputs.destroy_type == 'namespace-only' }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Deleting Namespace: ${{ env.NAMESPACE }}"
+          echo "=========================================="
+
+          if [ "${{ steps.oc-login.outputs.logged_in }}" != "true" ]; then
+            echo "⚠️ Not logged in to cluster, skipping namespace deletion"
+            exit 0
+          fi
+
+          # Check if namespace exists
+          if oc get namespace ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "Deleting all resources in namespace..."
+            
+            # Delete deployments first
+            oc delete deployments --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete services
+            oc delete services --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete routes
+            oc delete routes --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete configmaps
+            oc delete configmaps --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete secrets (except default ones)
+            oc delete secrets --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete HPA
+            oc delete hpa --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete PDB
+            oc delete pdb --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Delete network policies
+            oc delete networkpolicies --all -n ${{ env.NAMESPACE }} --timeout=60s || true
+            
+            # Finally delete the namespace
+            echo ""
+            echo "Deleting namespace..."
+            oc delete namespace ${{ env.NAMESPACE }} --timeout=120s || true
+            
+            echo "✅ Namespace deleted!"
+          else
+            echo "⚠️ Namespace ${{ env.NAMESPACE }} not found"
+          fi
+
+      # -----------------------------------------
+      # Delete ECR Repository
+      # -----------------------------------------
+      - name: Delete ECR Repository
+        if: ${{ github.event.inputs.destroy_type == 'all (Complete Teardown)' || github.event.inputs.destroy_type == 'ecr-only' }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Deleting ECR Repository"
+          echo "=========================================="
+
+          REPO_NAME="${{ env.ECR_REPOSITORY }}-${{ github.event.inputs.environment }}"
+
+          # Check if repository exists
+          if aws ecr describe-repositories --repository-names $REPO_NAME &>/dev/null; then
+            echo "Deleting repository: $REPO_NAME"
+            
+            # Delete all images first
+            echo "Deleting all images..."
+            IMAGES=$(aws ecr list-images --repository-name $REPO_NAME --query 'imageIds[*]' --output json)
+            
+            if [ "$IMAGES" != "[]" ]; then
+              aws ecr batch-delete-image \
+                --repository-name $REPO_NAME \
+                --image-ids "$IMAGES" || true
+            fi
+            
+            # Delete the repository
+            aws ecr delete-repository \
+              --repository-name $REPO_NAME \
+              --force
+            
+            echo "✅ ECR repository deleted!"
+          else
+            echo "⚠️ ECR repository $REPO_NAME not found"
+          fi
+
+      # -----------------------------------------
+      # Delete ROSA Cluster
+      # -----------------------------------------
+      - name: Delete ROSA Cluster
+        if: ${{ github.event.inputs.destroy_type == 'all (Complete Teardown)' || github.event.inputs.destroy_type == 'cluster-only' }}
+        run: |
+          echo "=========================================="
+          echo "Deleting ROSA Cluster: ${{ env.CLUSTER_NAME }}"
+          echo "=========================================="
+
+          # Check if cluster exists
+          if rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} &>/dev/null; then
+            echo "Cluster found. Starting deletion..."
+            echo ""
+            echo "⚠️ WARNING: This will take 10-20 minutes"
+            echo ""
+            
+            # Delete the cluster
+            rosa delete cluster \
+              --cluster=${{ env.CLUSTER_NAME }} \
+              --yes \
+              --watch
+            
+            echo ""
+            echo "Waiting for cluster deletion to complete..."
+            
+            # Wait for cluster to be fully deleted
+            for i in {1..60}; do
+              if ! rosa describe cluster --cluster=${{ env.CLUSTER_NAME }} &>/dev/null; then
+                echo "✅ Cluster deleted successfully!"
+                break
+              fi
+              echo "Still deleting... (attempt $i/60)"
+              sleep 30
+            done
+            
+            # Delete operator roles
+            echo ""
+            echo "Deleting operator roles..."
+            rosa delete operator-roles \
+              --cluster=${{ env.CLUSTER_NAME }} \
+              --mode auto \
+              --yes || echo "⚠️ Operator roles may already be deleted"
+            
+            # Delete OIDC provider
+            echo ""
+            echo "Deleting OIDC provider..."
+            rosa delete oidc-provider \
+              --cluster=${{ env.CLUSTER_NAME }} \
+              --mode auto \
+              --yes || echo "⚠️ OIDC provider may already be deleted"
+            
+          else
+            echo "⚠️ Cluster ${{ env.CLUSTER_NAME }} not found"
+          fi
+
+      # -----------------------------------------
+      # Delete VPC
+      # -----------------------------------------
+      - name: Delete VPC
+        if: ${{ github.event.inputs.destroy_type == 'all (Complete Teardown)' || github.event.inputs.destroy_type == 'vpc-only' }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Deleting VPC Resources"
+          echo "=========================================="
+
+          VPC_NAME="${{ env.CLUSTER_NAME }}-vpc"
+
+          # Find VPC by name
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=$VPC_NAME" \
+            --query 'Vpcs[0].VpcId' \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
+            echo "⚠️ VPC $VPC_NAME not found"
+            exit 0
+          fi
+
+          echo "Found VPC: $VPC_ID"
+          echo ""
+
+          # Delete NAT Gateways
+          echo "Deleting NAT Gateways..."
+          NAT_GWS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NatGateways[*].NatGatewayId' \
+            --output text || echo "")
+
+          for nat in $NAT_GWS; do
+            if [ -n "$nat" ]; then
+              echo "  Deleting NAT Gateway: $nat"
+              aws ec2 delete-nat-gateway --nat-gateway-id $nat || true
+            fi
+          done
+
+          # Wait for NAT Gateways to be deleted
+          if [ -n "$NAT_GWS" ]; then
+            echo "Waiting for NAT Gateways to be deleted..."
+            sleep 60
+          fi
+
+          # Delete Internet Gateway
+          echo "Deleting Internet Gateway..."
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' \
+            --output text || echo "")
+
+          if [ -n "$IGW_ID" ] && [ "$IGW_ID" != "None" ]; then
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID || true
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID || true
+          fi
+
+          # Delete Subnets
+          echo "Deleting Subnets..."
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' \
+            --output text || echo "")
+
+          for subnet in $SUBNETS; do
+            if [ -n "$subnet" ]; then
+              echo "  Deleting Subnet: $subnet"
+              aws ec2 delete-subnet --subnet-id $subnet || true
+            fi
+          done
+
+          # Delete Route Tables (except main)
+          echo "Deleting Route Tables..."
+          ROUTE_TABLES=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[?Associations[0].Main != `true`].RouteTableId' \
+            --output text || echo "")
+
+          for rt in $ROUTE_TABLES; do
+            if [ -n "$rt" ]; then
+              echo "  Deleting Route Table: $rt"
+              # Delete associations first
+              ASSOCIATIONS=$(aws ec2 describe-route-tables \
+                --route-table-ids $rt \
+                --query 'RouteTables[0].Associations[*].RouteTableAssociationId' \
+                --output text || echo "")
+              for assoc in $ASSOCIATIONS; do
+                aws ec2 disassociate-route-table --association-id $assoc 2>/dev/null || true
+              done
+              aws ec2 delete-route-table --route-table-id $rt || true
+            fi
+          done
+
+          # Delete Security Groups (except default)
+          echo "Deleting Security Groups..."
+          SECURITY_GROUPS=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[?GroupName != `default`].GroupId' \
+            --output text || echo "")
+
+          for sg in $SECURITY_GROUPS; do
+            if [ -n "$sg" ]; then
+              echo "  Deleting Security Group: $sg"
+              aws ec2 delete-security-group --group-id $sg || true
+            fi
+          done
+
+          # Delete VPC
+          echo ""
+          echo "Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID
+
+          echo "✅ VPC deleted!"
+
+      # -----------------------------------------
+      # Cleanup Account Roles (Optional)
+      # -----------------------------------------
+      - name: Cleanup Account Roles
+        if: ${{ github.event.inputs.destroy_type == 'all (Complete Teardown)' }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "Note: Account-wide ROSA roles NOT deleted"
+          echo "=========================================="
+          echo ""
+          echo "The following resources are NOT automatically deleted:"
+          echo "  - ROSA account roles (shared across clusters)"
+          echo "  - IAM policies"
+          echo ""
+          echo "To delete account roles manually, run:"
+          echo "  rosa delete account-roles --mode auto --yes"
+          echo ""
+          echo "⚠️ Only delete account roles if no other ROSA clusters exist"
+
+      # -----------------------------------------
+      # Destruction Summary
+      # -----------------------------------------
+      - name: Destruction Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🗑️ Destruction Complete"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Destroy Type: ${{ github.event.inputs.destroy_type }}"
+          echo ""
+          echo "----------------------------------------"
+          echo "Resources Destroyed:"
+          echo "----------------------------------------"
+
+          if [ "${{ github.event.inputs.destroy_type }}" == "all (Complete Teardown)" ] || \
+             [ "${{ github.event.inputs.destroy_type }}" == "namespace-only" ]; then
+            echo "✅ Namespace: ${{ env.NAMESPACE }}"
+          fi
+
+          if [ "${{ github.event.inputs.destroy_type }}" == "all (Complete Teardown)" ] || \
+             [ "${{ github.event.inputs.destroy_type }}" == "ecr-only" ]; then
+            echo "✅ ECR Repository: ${{ env.ECR_REPOSITORY }}-${{ github.event.inputs.environment }}"
+          fi
+
+          if [ "${{ github.event.inputs.destroy_type }}" == "all (Complete Teardown)" ] || \
+             [ "${{ github.event.inputs.destroy_type }}" == "cluster-only" ]; then
+            echo "✅ ROSA Cluster: ${{ env.CLUSTER_NAME }}"
+            echo "✅ Operator Roles"
+            echo "✅ OIDC Provider"
+          fi
+
+          if [ "${{ github.event.inputs.destroy_type }}" == "all (Complete Teardown)" ] || \
+             [ "${{ github.event.inputs.destroy_type }}" == "vpc-only" ]; then
+            echo "✅ VPC: ${{ env.CLUSTER_NAME }}-vpc"
+            echo "✅ Subnets"
+            echo "✅ Internet Gateway"
+            echo "✅ Route Tables"
+            echo "✅ Security Groups"
+          fi
+
+          echo ""
+          echo "----------------------------------------"
+          echo "Backup Available: ${{ github.event.inputs.backup_before_destroy }}"
+          echo "----------------------------------------"
+
+          if [ "${{ github.event.inputs.backup_before_destroy }}" == "true" ]; then
+            echo "Backup artifact: cluster-backup-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+            echo "Retention: 30 days"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "⚠️ IMPORTANT NOTES"
+          echo "=========================================="
+          echo ""
+          echo "1. Some resources may take additional time to fully delete"
+          echo "2. Check AWS Console for any remaining resources"
+          echo "3. Account-wide ROSA roles were NOT deleted"
+          echo "4. Review AWS Cost Explorer for any lingering charges"
+          echo ""
